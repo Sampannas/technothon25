@@ -1,12 +1,10 @@
-#include <Wire.h>
-#include <LiquidCrystal_I2C.h>
+#include <U8g2lib.h>
 #include <Bounce2.h>
+#include <Wire.h> 
 
 // --- Hardware Definitions ---
-
-// I2C LCD Screen (16 columns, 2 rows)
-// Common address is 0x27, but 0x3F is also possible.
-LiquidCrystal_I2C lcd(0x27, 16, 2);
+// Setup U8g2 for SSD1306 (128x64) using Hardware I2C
+U8G2_SSD1306_128X64_NONAME_F_HW_I2C u8g2(U8G2_R0, /* reset=*/ U8X8_PIN_NONE);
 
 // Button Pins (using internal pullups)
 #define BTN_PREV_UP_PIN 12
@@ -18,7 +16,6 @@ Bounce btnPrevUp = Bounce();
 Bounce btnNextDown = Bounce();
 Bounce btnSelectPlay = Bounce();
 
-// Time in milliseconds for a double-click
 #define DOUBLE_CLICK_MS 300 
 unsigned long lastPrevPressTime = 0;
 
@@ -35,30 +32,39 @@ const int numSongs = sizeof(songList) / sizeof(songList[0]);
 
 // --- State Machine ---
 enum PlayerState {
+  STATE_SPLASH,
   STATE_BROWSING,
-  STATE_PLAYING,
-  STATE_PAUSED
+  STATE_PLAYING
 };
-PlayerState currentState = STATE_BROWSING;
+PlayerState currentState = STATE_SPLASH;
 
-int selectedSongIndex = 0; // For the browsing menu
-int playingSongIndex = 0;  // The song currently loaded
+// --- Player Status ---
+int selectedSongIndex = 0;
+int playingSongIndex = 0;
+bool isPlaying = false; 
+
+// --- Mock Playback Timer ---
+int songDurationSec = 245;    // (4:05) Mock duration
+int currentSongTimeSec = 0;   // Current "playback" time
+unsigned long lastTimeUpdate = 0; // For 1-second timer
 
 // --- Function Declarations ---
 void updateDisplay();
+void handleNextSong();
+void handlePrevSong();
+String formatTime(int totalSeconds);
 
-
+// ------------------------------------
+//          SETUP
+// ------------------------------------
 void setup() {
   Serial.begin(115200);
 
-  // Setup I2C LCD
-  Wire.begin(); // For ESP32, default I2C is 21 (SDA), 22 (SCL)
-  lcd.init();
-  lcd.backlight();
-  lcd.setCursor(0, 0);
-  lcd.print("MP3 Player");
-  lcd.setCursor(0, 1);
-  lcd.print("Loading...");
+  // Tell Wire to use pins 21 (SDA) and 22 (SCL)
+  Wire.begin(21, 22); 
+
+  // Setup U8g2 Display
+  u8g2.begin();
 
   // Setup Buttons
   pinMode(BTN_PREV_UP_PIN, INPUT_PULLUP);
@@ -69,129 +75,256 @@ void setup() {
   btnNextDown.attach(BTN_NEXT_DOWN_PIN);
   btnSelectPlay.attach(BTN_SELECT_PLAY_PIN);
 
-  btnPrevUp.interval(25); // Debounce interval in ms
+  btnPrevUp.interval(25);
   btnNextDown.interval(25);
   btnSelectPlay.interval(25);
 
-  delay(1000);
-  updateDisplay(); // Show the initial browsing screen
+  updateDisplay(); // Show the initial (Splash) screen
+  delay(1500); // Hold the splash screen
+  
+  if (currentState == STATE_SPLASH) {
+     currentState = STATE_BROWSING;
+     updateDisplay();
+  }
 }
 
+// ------------------------------------
+//          MAIN LOOP
+// ------------------------------------
 void loop() {
   // Update all button states
   btnPrevUp.update();
   btnNextDown.update();
   btnSelectPlay.update();
 
-  // --- Handle Button Presses ---
-
-  // Button 3: Select / Play / Pause
-  if (btnSelectPlay.fell()) {
-    if (currentState == STATE_BROWSING) {
-      // Start playing the selected song
-      playingSongIndex = selectedSongIndex;
-      currentState = STATE_PLAYING;
-      Serial.println("Action: Play");
-    } else if (currentState == STATE_PLAYING) {
-      // Pause the song
-      currentState = STATE_PAUSED;
-      Serial.println("Action: Pause");
-    } else if (currentState == STATE_PAUSED) {
-      // Resume the song
-      currentState = STATE_PLAYING;
-      Serial.println("Action: Resume");
-    }
-    updateDisplay(); // Update screen on state change
-  }
-
-  // Button 2: Next / Down
-  if (btnNextDown.fell()) {
-    if (currentState == STATE_BROWSING) {
-      // Scroll down the list
-      selectedSongIndex = (selectedSongIndex + 1) % numSongs;
-      Serial.print("Scroll Down. Selected: ");
-      Serial.println(selectedSongIndex);
-    } else {
-      // Skip to the next track
-      playingSongIndex = (playingSongIndex + 1) % numSongs;
-      currentState = STATE_PLAYING; // Ensure it's playing
-      Serial.print("Action: Next Song. Now playing: ");
-      Serial.println(playingSongIndex);
-    }
-    updateDisplay();
-  }
-
-  // Button 1: Prev / Up / Rewind (with double-click)
-  if (btnPrevUp.fell()) {
-    if (currentState == STATE_BROWSING) {
-      // Scroll up the list
-      selectedSongIndex--;
-      if (selectedSongIndex < 0) {
-        selectedSongIndex = numSongs - 1; // Wrap around
-      }
-      Serial.print("Scroll Up. Selected: ");
-      Serial.println(selectedSongIndex);
-    } else {
-      // Playing or Paused state: Handle single/double click
-      unsigned long pressTime = millis();
-      if (pressTime - lastPrevPressTime < DOUBLE_CLICK_MS) {
-        // --- Double Click: Previous Song ---
-        playingSongIndex--;
-        if (playingSongIndex < 0) {
-          playingSongIndex = numSongs - 1; // Wrap around
-        }
-        currentState = STATE_PLAYING; // Ensure it's playing
-        Serial.print("Action: Previous Song. Now playing: ");
-        Serial.println(playingSongIndex);
-        lastPrevPressTime = 0; // Reset timer to prevent triple-click
+  // --- 1. Handle Mock Playback Timer ---
+  if (currentState == STATE_PLAYING && isPlaying) {
+    if (millis() - lastTimeUpdate > 1000) {
+      currentSongTimeSec++;
+      lastTimeUpdate = millis();
+      if (currentSongTimeSec > songDurationSec) {
+        handleNextSong(); 
       } else {
-        // --- Single Click: Rewind to Beginning ---
-        // (No state change, just an action)
-        Serial.print("Action: Rewind song ");
-        Serial.println(playingSongIndex);
-        lastPrevPressTime = pressTime;
+        updateDisplay(); 
       }
     }
+  }
+
+  // --- 2. Handle Button Inputs Based on State ---
+  switch (currentState) {
+    case STATE_SPLASH:
+      handleSplashInput();
+      break;
+    case STATE_BROWSING:
+      handleBrowsingInput();
+      break;
+    case STATE_PLAYING:
+      handlePlayingInput();
+      break;
+  }
+}
+
+// ------------------------------------
+//      BUTTON HANDLER FUNCTIONS
+// ------------------------------------
+
+/** Handles input for the "Welcome" screen */
+void handleSplashInput() {
+  if (btnSelectPlay.fell()) {
+    currentState = STATE_BROWSING;
     updateDisplay();
   }
 }
 
+/** Handles input for the "Choose Song" menu */
+void handleBrowsingInput() {
+  // Button 3: Select Song
+  if (btnSelectPlay.fell()) {
+    playingSongIndex = selectedSongIndex;
+    currentState = STATE_PLAYING;
+    isPlaying = true; 
+    currentSongTimeSec = 0;
+    songDurationSec = 180 + (playingSongIndex * 15); 
+    lastTimeUpdate = millis();
+    Serial.println("Action: Play");
+    updateDisplay(); 
+  }
+
+  // Button 2: Scroll Down
+  if (btnNextDown.fell()) {
+    selectedSongIndex = (selectedSongIndex + 1) % numSongs;
+    updateDisplay(); 
+  }
+
+  // Button 1: Scroll Up
+  if (btnPrevUp.fell()) {
+    selectedSongIndex--;
+    if (selectedSongIndex < 0) {
+      selectedSongIndex = numSongs - 1; 
+    }
+    updateDisplay(); 
+  }
+}
+
+/** Handles input for the "Now Playing" screen */
+void handlePlayingInput() {
+  // Button 3: Play/Pause Toggle
+  if (btnSelectPlay.fell()) {
+    isPlaying = !isPlaying; 
+    if (isPlaying) {
+      Serial.println("Action: Resume");
+      lastTimeUpdate = millis(); 
+    } else {
+      Serial.println("Action: Pause");
+    }
+    updateDisplay(); 
+  }
+
+  // Button 2: Next Song
+  if (btnNextDown.fell()) {
+    handleNextSong();
+  }
+
+  // Button 1: Prev / Rewind
+  if (btnPrevUp.fell()) {
+    unsigned long pressTime = millis();
+    if (pressTime - lastTimeUpdate < DOUBLE_CLICK_MS) {
+      Serial.println("Action: Previous Song");
+      handlePrevSong();
+      lastPrevPressTime = 0; 
+    } else {
+      Serial.println("Action: Rewind song");
+      currentSongTimeSec = 0; 
+      lastTimeUpdate = millis();
+      lastPrevPressTime = pressTime;
+      updateDisplay(); 
+    }
+  }
+}
+
+// ------------------------------------
+//      ACTION HELPER FUNCTIONS
+// ------------------------------------
+
+/** Loads and plays the next song */
+void handleNextSong() {
+  playingSongIndex = (playingSongIndex + 1) % numSongs;
+  isPlaying = true;
+  currentSongTimeSec = 0;
+  songDurationSec = 180 + (playingSongIndex * 15); 
+  lastTimeUpdate = millis();
+  updateDisplay(); 
+}
+
+/** Loads and plays the previous song */
+void handlePrevSong() {
+  playingSongIndex--;
+  if (playingSongIndex < 0) {
+    playingSongIndex = numSongs - 1;
+  }
+  isPlaying = true;
+  currentSongTimeSec = 0;
+  songDurationSec = 180 + (playingSongIndex * 15); 
+  lastTimeUpdate = millis();
+  updateDisplay(); 
+}
+
+// ------------------------------------
+//      DISPLAY FUNCTIONS
+// ------------------------------------
+
 /**
- * @brief Updates the LCD screen based on the current player state.
+ * @brief Formats total seconds into an "MM:SS" string.
  */
+String formatTime(int totalSeconds) {
+  int minutes = totalSeconds / 60;
+  int seconds = totalSeconds % 60;
+  char timeString[6]; // "MM:SS" + null
+  sprintf(timeString, "%02d:%02d", minutes, seconds);
+  return String(timeString);
+}
+
+
 /**
- * @brief Updates the LCD screen based on the current player state.
+ * @brief Redraws the ENTIRE LCD screen based on the current state.
  */
 void updateDisplay() {
-  lcd.clear();
-  lcd.setCursor(0, 0);
+  u8g2.clearBuffer(); // Clear the internal memory
 
   switch (currentState) {
-    case STATE_BROWSING: {  // <-- ADDED this curly brace
-      // Show the selected song with a cursor
-      lcd.print(">"); // Cursor
-      lcd.print(songList[selectedSongIndex]);
-
-      // Show the next song on the second line (if it exists)
-      lcd.setCursor(0, 1);
-      int nextIndex = (selectedSongIndex + 1) % numSongs; // This is now safe
-      lcd.print(" "); // Indent
-      lcd.print(songList[nextIndex]);
+    case STATE_SPLASH: {
+      u8g2.setFont(u8g2_font_ncenB10_tr); 
+      u8g2.drawStr(10, 25, "ESP32 Player");
+      u8g2.setFont(u8g2_font_7x13_tr); 
+      u8g2.drawStr(28, 45, "Loading...");
       break;
-    } // <-- AND ADDED this curly brace
+    }
 
-    case STATE_PLAYING:
-      // Show "Now Playing" icon and song name
-      lcd.print("Now Playing  >"); // > is a "play" icon
-      lcd.setCursor(0, 1);
-      lcd.print(songList[playingSongIndex]);
-      break;
+    case STATE_BROWSING: { 
+      u8g2.setFont(u8g2_font_8x13_tr); 
+      u8g2.drawStr(0, 12, "Choose Song:");
+      
+      u8g2.drawRFrame(0, 18, 128, 18, 3); 
+      u8g2.setFont(u8g2_font_profont12_tr); 
+      
+      u8g2.drawStr(4, 32, songList[selectedSongIndex]);
 
-    case STATE_PAUSED:
-      // Show "Paused" icon and song name
-      lcd.print("Paused      ||"); // || is a "pause" icon
-      lcd.setCursor(0, 1);
-      lcd.print(songList[playingSongIndex]);
+      int nextIndex = (selectedSongIndex + 1) % numSongs;
+      u8g2.drawStr(4, 52, songList[nextIndex]);
       break;
+    } 
+
+    // --- THIS IS THE MODIFIED SECTION ---
+    case STATE_PLAYING: {
+      // --- 1. Draw Album Art Placeholder (Left Side) ---
+      // This draws a 64x64 box.
+      // Replace this with u8g2.drawXBM(0, 0, 64, 64, your_art_array);
+      u8g2.drawFrame(0, 0, 64, 64);
+      u8g2.setFont(u8g2_font_4x6_tr); // Tiny font for placeholder
+      u8g2.drawStr(12, 30, "ALBUM");
+      u8g2.drawStr(16, 38, "ART");
+
+
+      // --- 2. Draw Text (Right Side) ---
+      int textX = 66; // Starting X for all text (right of the art)
+
+      // Song Name (truncated to fit 64px width)
+      u8g2.setFont(u8g2_font_profont11_tr); // 6px wide font
+      char nameBuf[11]; // 64px / 6px/char = ~10 chars + null
+      
+      // Copy first 10 chars for line 1
+      strncpy(nameBuf, songList[playingSongIndex], 10);
+      nameBuf[10] = '\0'; 
+      u8g2.drawStr(textX, 12, nameBuf);
+
+      // (Optional) Draw line 2 if name is longer than 10 chars
+      if (strlen(songList[playingSongIndex]) > 10) {
+         strncpy(nameBuf, songList[playingSongIndex] + 10, 10); // Get next 10
+         nameBuf[10] = '\0'; 
+         u8g2.drawStr(textX, 24, nameBuf); // Draw on line 2
+      }
+
+      // Time Display
+      u8g2.setFont(u8g2_font_t0_11b_tr); // Small, clear font
+      String timeDisplay = formatTime(currentSongTimeSec) + "/" + formatTime(songDurationSec);
+      u8g2.drawStr(textX, 40, timeDisplay.c_str());
+
+      // Progress Bar (60px wide)
+      float percent = (float)currentSongTimeSec / (float)songDurationSec;
+      int barWidth = (int)(percent * 60); // 60px wide bar
+      u8g2.drawFrame(textX, 48, 60, 8);      // Outline
+      u8g2.drawBox(textX, 48, barWidth, 8); // Fill
+      
+      // Play/Pause Icon
+      u8g2.setFont(u8g2_font_10x20_tr); // Big icon
+      if (isPlaying) {
+        u8g2.drawStr(textX + 45, 62, ">"); // Play icon
+      } else {
+        u8g2.drawStr(textX + 42, 62, "||"); // Pause icon
+      }
+      break;
+    }
   }
+  
+  u8g2.sendBuffer(); // Send the completed drawing to the screen
 }

@@ -1,6 +1,8 @@
 #include <U8g2lib.h>
 #include <Bounce2.h>
 #include <Wire.h> 
+#include "LittleFS.h" // <-- For reading the file system
+#include <vector>      // <-- For creating a dynamic list
 
 // --- Hardware Definitions ---
 // Setup U8g2 for SSD1306 (128x64) using Hardware I2C
@@ -19,16 +21,9 @@ Bounce btnSelectPlay = Bounce();
 #define DOUBLE_CLICK_MS 300 
 unsigned long lastPrevPressTime = 0;
 
-// --- Song List ---
-const char* songList[] = {
-  "Song 1.mp3",
-  "Track 2 - Artist",
-  "My Favorite Tune",
-  "Audiofile_004",
-  "B-Side",
-  "Podcast Ep. 12"
-};
-const int numSongs = sizeof(songList) / sizeof(songList[0]);
+// --- Song List (Now dynamic!) ---
+std::vector<String> songList;
+int numSongs = 0;
 
 // --- State Machine ---
 enum PlayerState {
@@ -52,6 +47,7 @@ unsigned long lastTimeUpdate = 0; // For 1-second timer
 void updateDisplay();
 void handleNextSong();
 void handlePrevSong();
+void loadSongList();
 String formatTime(int totalSeconds);
 
 // ------------------------------------
@@ -79,6 +75,15 @@ void setup() {
   btnNextDown.interval(25);
   btnSelectPlay.interval(25);
 
+  // --- NEW: Load files from LittleFS ---
+  if (!LittleFS.begin(true)) {
+    Serial.println("LittleFS Mount Failed");
+    return;
+  }
+
+  loadSongList(); // Scan the filesystem and fill the list
+  numSongs = songList.size(); // Update the total count
+
   updateDisplay(); // Show the initial (Splash) screen
   delay(1500); // Hold the splash screen
   
@@ -86,6 +91,33 @@ void setup() {
      currentState = STATE_BROWSING;
      updateDisplay();
   }
+}
+
+/**
+ * @brief Scans the root of LittleFS and adds file names to the list.
+ */
+void loadSongList() {
+  Serial.println("Scanning LittleFS for files...");
+  File root = LittleFS.open("/");
+  if (!root) {
+    Serial.println("- Failed to open root directory");
+    return;
+  }
+
+  File file = root.openNextFile();
+  while (file) {
+    if (!file.isDirectory()) {
+      // Add the file name (e.g., "/song1.mp3") to our list
+      songList.push_back(String(file.name()));
+      Serial.print("  Found file: ");
+      Serial.println(file.name());
+    }
+    file = root.openNextFile();
+  }
+  
+  root.close();
+  file.close();
+  Serial.println("File scan complete.");
 }
 
 // ------------------------------------
@@ -108,6 +140,11 @@ void loop() {
         updateDisplay(); 
       }
     }
+  }
+
+  // Don't process button inputs if no songs were found
+  if (numSongs == 0) {
+    return; 
   }
 
   // --- 2. Handle Button Inputs Based on State ---
@@ -188,7 +225,7 @@ void handlePlayingInput() {
   // Button 1: Prev / Rewind
   if (btnPrevUp.fell()) {
     unsigned long pressTime = millis();
-    if (pressTime - lastTimeUpdate < DOUBLE_CLICK_MS) {
+    if (pressTime - lastPrevPressTime < DOUBLE_CLICK_MS) {
       Serial.println("Action: Previous Song");
       handlePrevSong();
       lastPrevPressTime = 0; 
@@ -264,63 +301,72 @@ void updateDisplay() {
       u8g2.setFont(u8g2_font_8x13_tr); 
       u8g2.drawStr(0, 12, "Choose Song:");
       
-      u8g2.drawRFrame(0, 18, 128, 18, 3); 
-      u8g2.setFont(u8g2_font_profont12_tr); 
-      
-      u8g2.drawStr(4, 32, songList[selectedSongIndex]);
+      // Check if we found any songs
+      if (numSongs == 0) {
+        u8g2.setFont(u8g2_font_profont12_tr); 
+        u8g2.drawStr(10, 40, "No songs found!");
+      } else {
+        u8g2.drawRFrame(0, 18, 128, 18, 3); 
+        u8g2.setFont(u8g2_font_profont12_tr); 
+        
+        // Use .c_str() to convert Arduino String to C-string
+        u8g2.drawStr(4, 32, songList[selectedSongIndex].c_str());
 
-      int nextIndex = (selectedSongIndex + 1) % numSongs;
-      u8g2.drawStr(4, 52, songList[nextIndex]);
+        int nextIndex = (selectedSongIndex + 1) % numSongs;
+        u8g2.drawStr(4, 52, songList[nextIndex].c_str());
+      }
       break;
     } 
 
-    // --- THIS IS THE MODIFIED SECTION ---
     case STATE_PLAYING: {
-      // --- 1. Draw Album Art Placeholder (Left Side) ---
-      // This draws a 64x64 box.
-      // Replace this with u8g2.drawXBM(0, 0, 64, 64, your_art_array);
-      u8g2.drawFrame(0, 0, 64, 64);
-      u8g2.setFont(u8g2_font_4x6_tr); // Tiny font for placeholder
-      u8g2.drawStr(12, 30, "ALBUM");
-      u8g2.drawStr(16, 38, "ART");
+      // --- Header: "Now Playing" ---
+      u8g2.setFont(u8g2_font_6x10_tr);
+      u8g2.drawStr(2, 9, "Now Playing:");
+      u8g2.drawLine(0, 11, 128, 11); // Separator line
 
-
-      // --- 2. Draw Text (Right Side) ---
-      int textX = 66; // Starting X for all text (right of the art)
-
-      // Song Name (truncated to fit 64px width)
-      u8g2.setFont(u8g2_font_profont11_tr); // 6px wide font
-      char nameBuf[11]; // 64px / 6px/char = ~10 chars + null
+      // --- Song Name (2 lines, centered area) ---
+      u8g2.setFont(u8g2_font_7x13_tr); // Nice readable font
+      char line1[19]; // ~18 chars for 128px width
+      char line2[19];
       
-      // Copy first 10 chars for line 1
-      strncpy(nameBuf, songList[playingSongIndex], 10);
-      nameBuf[10] = '\0'; 
-      u8g2.drawStr(textX, 12, nameBuf);
-
-      // (Optional) Draw line 2 if name is longer than 10 chars
-      if (strlen(songList[playingSongIndex]) > 10) {
-         strncpy(nameBuf, songList[playingSongIndex] + 10, 10); // Get next 10
-         nameBuf[10] = '\0'; 
-         u8g2.drawStr(textX, 24, nameBuf); // Draw on line 2
+      // Split song name across two lines
+      // Use .c_str() to convert Arduino String to C-string
+      const char* songName = songList[playingSongIndex].c_str();
+      int nameLen = strlen(songName);
+      if (nameLen <= 18) {
+        // Short name - center it on one line
+        strncpy(line1, songName, 18);
+        line1[18] = '\0';
+        u8g2.drawStr(4, 26, line1);
+      } else {
+        // Long name - split across two lines
+        strncpy(line1, songName, 18);
+        line1[18] = '\0';
+        strncpy(line2, songName + 18, 18);
+        line2[18] = '\0';
+        u8g2.drawStr(4, 24, line1);
+        u8g2.drawStr(4, 36, line2);
       }
 
-      // Time Display
-      u8g2.setFont(u8g2_font_t0_11b_tr); // Small, clear font
-      String timeDisplay = formatTime(currentSongTimeSec) + "/" + formatTime(songDurationSec);
-      u8g2.drawStr(textX, 40, timeDisplay.c_str());
+      // --- Time Display (centered) ---
+      u8g2.setFont(u8g2_font_6x10_tr);
+      String timeDisplay = formatTime(currentSongTimeSec) + " / " + formatTime(songDurationSec);
+      int timeWidth = timeDisplay.length() * 6; // Approximate width
+      u8g2.drawStr((128 - timeWidth) / 2, 48, timeDisplay.c_str());
 
-      // Progress Bar (60px wide)
+      // --- Progress Bar (80% width) + Play/Pause Icon ---
       float percent = (float)currentSongTimeSec / (float)songDurationSec;
-      int barWidth = (int)(percent * 60); // 60px wide bar
-      u8g2.drawFrame(textX, 48, 60, 8);      // Outline
-      u8g2.drawBox(textX, 48, barWidth, 8); // Fill
-      
-      // Play/Pause Icon
-      u8g2.setFont(u8g2_font_10x20_tr); // Big icon
+      int barFullWidth = 102; // ~80% of 128px
+      int barWidth = (int)(percent * barFullWidth);
+      u8g2.drawFrame(2, 54, barFullWidth, 8);        // Outline
+      u8g2.drawBox(2, 54, barWidth, 8);              // Fill
+
+      // Play/Pause Icon (next to progress bar)
+      u8g2.setFont(u8g2_font_9x15_tr); // Medium-large icon font
       if (isPlaying) {
-        u8g2.drawStr(textX + 45, 62, ">"); // Play icon
+        u8g2.drawStr(110, 62, ">");  // Play triangle
       } else {
-        u8g2.drawStr(textX + 42, 62, "||"); // Pause icon
+        u8g2.drawStr(108, 62, "||"); // Pause bars
       }
       break;
     }

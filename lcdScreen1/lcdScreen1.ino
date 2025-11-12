@@ -1,29 +1,15 @@
-#include <AudioLogger.h>
-#include <AudioTools.h>
-#include <AudioToolsConfig.h>
-
 #include <TFT_eSPI.h> // For the color TFT
+// #include <SPI.h>   // <-- No longer needed for SD_MMC
 #include <Bounce2.h>
 #include <vector>     // Include vector library
 #include <Arduino.h>
 #include <SD_MMC.h>     // <-- Correct
 #include <ArduinoJson.h>
-// #include "Audio.h" // <-- REMOVED
-
-// --- ADDED: AudioTools Includes ---
-#include "AudioTools/AudioCodecs/CodecMP3Helix.h"
-// ----------------------------------
-
+#include "Audio.h" // Assumes this is the ESP8266Audio or similar library
+#include "AudioTools.h"  // Arduino Audio Tools for metadata extraction
+#include "AudioTools/AudioCodecs/CodecMP3Helix.h"  // For MP3 metadata
 TFT_eSPI tft = TFT_eSPI();
-
-// --- ADDED: AudioTools Objects ---
-AudioSourceSD source(SD_MMC); // Source: SD_MMC card
-AudioSinkI2S i2s_out;         // Sink: I2S DAC
-MP3Decoder mp3;               // Decoder for MP3
-AudioInfo info;               // To store metadata
-AudioStreamX copy_stream;     // Moves data from decoder to sink
-AudioDecoder *decoder = &mp3; // Pointer to the active decoder
-// ---------------------------------
+Audio audio;
 
 // Button Pins
 #define BTN_PREV_UP_PIN 12
@@ -66,7 +52,6 @@ struct Song {
   String artist;
   String album;
   String albumArt;
-  int duration; // <-- ADDED: To store real song length
 };
 
 std::vector<Song> songs;
@@ -109,10 +94,10 @@ int prevSongTimeSec = -1;
 bool prevIsPlaying = false;
 int prevPlayingSongIndex = -1;
 
-// --- Playback Timer ---
-int songDurationSec = 0; // <-- CHANGED: Will be loaded from metadata
+// --- Mock Playback Timer ---
+int songDurationSec = 245;
 int currentSongTimeSec = 0;
-// unsigned long lastTimeUpdate = 0; // <-- CHANGED: No longer needed
+unsigned long lastTimeUpdate = 0;
 
 // --- Function Declarations ---
 void updateDisplay();
@@ -131,7 +116,7 @@ void updatePlayPauseButton();
 void handleHomeInput();
 void handleMenuInput();
 void handlePlayingInput();
-void startPlayback(int songIndex); // <-- ADDED
+void parseID3v2Tags(uint8_t* data, uint32_t size, String& title, String& artist, String& album);
 
 // ------------------------------------
 //         METADATA GENERATION
@@ -148,68 +133,170 @@ bool generateMetadata() {
     return false;
   }
 
-  DynamicJsonDocument doc(16384);
+  DynamicJsonDocument doc(32768);
   JsonArray songsArray = doc.createNestedArray("songs");
-
+  
+  int fileCount = 0;
   File file = root.openNextFile();
+  
   while (file) {
     if (!file.isDirectory() && String(file.name()).endsWith(".mp3")) {
       String filepath = String("/music/") + file.name();
-      Serial.print("Parsing metadata for: ");
-      Serial.println(filepath);
-
-      // --- CHANGED: Use AudioTools to parse metadata ---
-      // We use the 'source' object globally, so it's already set to SD_MMC
-      if (source.open(filepath.c_str())) {
-        info.begin(&source, true); // true = autoclose file after parsing
-
-        String title = info.title();
-        String artist = info.artist();
-        String album = info.album();
-        int duration = info.duration();
-
-        // --- Data Sanitization ---
-        if (title == "" || title == nullptr) {
-          title = file.name();
-          title.replace(".mp3", "");
-        }
-        if (artist == "" || artist == nullptr) artist = "Unknown Artist";
-        if (album == "" || album == nullptr) album = "Unknown Album";
-        if (duration <= 0) duration = 180; // Default 3 min if parsing failed
-
-        // Add to JSON
-        JsonObject song = songsArray.createNestedObject();
-        song["filename"] = file.name();
-        song["title"] = title;
-        song["artist"] = artist;
-        song["album"] = album;
-        song["duration"] = duration;
-
-        // You can update this later if you add album art logic
-        String albumArtFilename = "Unknown_Album.bmp"; 
-        song["albumArt"] = albumArtFilename;
+      
+      Serial.print("Processing file ");
+      Serial.print(++fileCount);
+      Serial.print(": ");
+      Serial.println(file.name());
+      
+      JsonObject song = songsArray.createNestedObject();
+      
+      // Default values
+      String title = file.name();
+      title.replace(".mp3", "");
+      String artist = "Unknown Artist";
+      String album = "Unknown Album";
+      
+      // Try simple ID3v1 extraction (safer, at end of file)
+      File mp3File = SD_MMC.open(filepath, "r");
+      if (mp3File && mp3File.size() > 128) {
+        // Seek to ID3v1 tag location (last 128 bytes)
+        mp3File.seek(mp3File.size() - 128);
         
-      } else {
-        Serial.print("Failed to open file: ");
-        Serial.println(filepath);
+        uint8_t id3v1[128];
+        if (mp3File.read(id3v1, 128) == 128) {
+          // Check for TAG identifier
+          if (id3v1[0] == 'T' && id3v1[1] == 'A' && id3v1[2] == 'G') {
+            // Extract fields (30 bytes each, null terminated)
+            char buffer[31];
+            
+            // Title
+            memset(buffer, 0, 31);
+            memcpy(buffer, &id3v1[3], 30);
+            String tempTitle = String(buffer);
+            tempTitle.trim();
+            if (tempTitle.length() > 0) {
+              title = tempTitle;
+              Serial.println("  Found title: " + title);
+            }
+            
+            // Artist
+            memset(buffer, 0, 31);
+            memcpy(buffer, &id3v1[33], 30);
+            String tempArtist = String(buffer);
+            tempArtist.trim();
+            if (tempArtist.length() > 0) {
+              artist = tempArtist;
+              Serial.println("  Found artist: " + artist);
+            }
+            
+            // Album
+            memset(buffer, 0, 31);
+            memcpy(buffer, &id3v1[63], 30);
+            String tempAlbum = String(buffer);
+            tempAlbum.trim();
+            if (tempAlbum.length() > 0) {
+              album = tempAlbum;
+              Serial.println("  Found album: " + album);
+            }
+          }
+        }
+        mp3File.close();
       }
-      // ----------------------------------------------------
+      
+      // Try to parse from filename if no metadata found
+      if (artist == "Unknown Artist" && title.indexOf(" - ") > 0) {
+        int dashPos = title.indexOf(" - ");
+        artist = title.substring(0, dashPos);
+        artist.trim();
+        title = title.substring(dashPos + 3);
+        title.trim();
+        Serial.println("  Parsed from filename:");
+        Serial.println("    Artist: " + artist);
+        Serial.println("    Title: " + title);
+      }
+      
+      song["filename"] = file.name();
+      song["title"] = title;
+      song["artist"] = artist;
+      song["album"] = album;
+      song["albumArt"] = album + ".bmp";
+      
+      // Yield to prevent watchdog timeout
+      yield();
     }
     file = root.openNextFile();
   }
-
+  
+  root.close();
+  
+  Serial.print("Indexed ");
+  Serial.print(fileCount);
+  Serial.println(" songs");
+  
+  // Save metadata file
   File metadataFile = SD_MMC.open("/metadata.json", "w");
   if (!metadataFile) {
     Serial.println("Failed to create metadata file");
     return false;
   }
-  if (serializeJson(doc, metadataFile) == 0) {
-    Serial.println("Failed to write to metadata file");
+  
+  size_t bytesWritten = serializeJson(doc, metadataFile);
+  metadataFile.close();
+  
+  if (bytesWritten == 0) {
+    Serial.println("Failed to write metadata");
     return false;
   }
-
-  metadataFile.close();
+  
+  Serial.print("Metadata file created: ");
+  Serial.print(bytesWritten);
+  Serial.println(" bytes");
+  
   return true;
+}
+
+// New helper function for ID3v2 parsing
+void parseID3v2Tags(uint8_t* data, uint32_t size, String& title, String& artist, String& album) {
+  uint32_t pos = 0;
+  
+  while (pos < size - 10) {
+    // Read frame header
+    char frameID[5] = {0};
+    memcpy(frameID, &data[pos], 4);
+    
+    // Check for padding (null bytes)
+    if (frameID[0] == 0) break;
+    
+    // Get frame size
+    uint32_t frameSize = (data[pos + 4] << 24) |
+                        (data[pos + 5] << 16) |
+                        (data[pos + 6] << 8) |
+                        data[pos + 7];
+    
+    if (frameSize == 0 || frameSize > size - pos - 10) break;
+    
+    // Extract text from frame (skip first byte which is encoding)
+    String frameText = "";
+    for (uint32_t i = 1; i < frameSize && (pos + 10 + i) < size; i++) {
+      char c = data[pos + 10 + i];
+      if (c >= 32 && c < 127) {  // Printable ASCII
+        frameText += c;
+      }
+    }
+    
+    frameText.trim();
+    
+    // Check frame ID and assign values
+    if (strcmp(frameID, "TIT2") == 0 && frameText.length() > 0) {
+      title = frameText;
+    } else if (strcmp(frameID, "TPE1") == 0 && frameText.length() > 0) {
+      artist = frameText;
+    } else if (strcmp(frameID, "TALB") == 0 && frameText.length() > 0) {
+      album = frameText;
+    }
+    
+    pos += 10 + frameSize;
+  }
 }
 
 // ------------------------------------
@@ -218,46 +305,46 @@ bool generateMetadata() {
 void setup() {
   Serial.begin(115200);
   
-  if (!SD_MMC.begin()) { // This initializes in 4-bit mode by default
-    Serial.println("SD_MMC Card Mount Failed!");
-    tft.init();
-    tft.fillScreen(TFT_RED);
-    tft.drawString("SD Card Error", 20, 20);
-    while (1); // Stop here
-  }
-  Serial.println("SD_MMC Card OK.");
-
-  // --- CHANGED: Configure Audio Output ---
-  auto cfg = i2s_out.defaultConfig();
-  cfg.pin_bck = 26; // Your BCLK pin
-  cfg.pin_ws = 25;  // Your LRC/WS pin
-  cfg.pin_data = 22; // Your DOUT pin
-  i2s_out.begin(cfg);
-  i2s_out.setVolume(0.5); // Volume from 0.0 to 1.0
-  copy_stream.begin(i2s_out); // Connect copy_stream to our output
-  // ---------------------------------------
-
-  // Set to 'true' to regenerate on every boot
-  // Set to 'false' to use existing metadata.json
-  bool REGENERATE_METADATA = false; 
+  // Initialize display first for user feedback
+  tft.init();
+  tft.setRotation(0);
+  tft.fillScreen(IPOD_BLACK);
+  tft.setTextColor(IPOD_WHITE);
+  tft.setTextDatum(MC_DATUM);
   
-  if (REGENERATE_METADATA || !SD_MMC.exists("/metadata.json")) {
-    Serial.println("Generating metadata...");
-    if (generateMetadata()) {
-      Serial.println("Metadata generated successfully");
-    } else {
-      Serial.println("Failed to generate metadata");
-    }
-  } else {
-    Serial.println("Metadata file already exists. Loading...");
+  if (!SD_MMC.begin()) {
+    Serial.println("SD_MMC Card Mount Failed!");
+    tft.fillScreen(TFT_RED);
+    tft.setTextSize(2);
+    tft.drawString("SD Card Error", SCREEN_WIDTH/2, SCREEN_HEIGHT/2);
+    while (1);
   }
-
-  loadMetadata(); // (This now correctly uses SD_MMC)
+  
+  Serial.println("SD_MMC Card OK.");
+  
+  // Show indexing message
+  tft.fillScreen(IPOD_BLACK);
+  tft.setTextSize(2);
+  tft.drawString("Indexing Music...", SCREEN_WIDTH/2, SCREEN_HEIGHT/2 - 20);
+  tft.setTextSize(1);
+  tft.drawString("Please wait", SCREEN_WIDTH/2, SCREEN_HEIGHT/2 + 20);
+  
+  Serial.println("Indexing music files...");
+  
+  if (generateMetadata()) {
+    Serial.println("Metadata generated successfully");
+    tft.drawString("Indexing complete!", SCREEN_WIDTH/2, SCREEN_HEIGHT/2 + 40);
+    delay(500);
+  } else {
+    Serial.println("Failed to generate metadata");
+    tft.setTextColor(TFT_RED);
+    tft.drawString("Indexing failed!", SCREEN_WIDTH/2, SCREEN_HEIGHT/2 + 40);
+    delay(2000);
+  }
+  
+  loadMetadata();
   populateMenuItems();
   
-  // --- Setup TFT Display ---
-  tft.init();
-  tft.setRotation(0); // Portrait mode (320x480)
   tft.fillScreen(IPOD_WHITE);
   
   // Setup Buttons
@@ -275,43 +362,27 @@ void setup() {
   
   requestRedraw(true);
 }
-
 // ------------------------------------
 //         MAIN LOOP
 // ------------------------------------
 void loop() {
   unsigned long currentTime = millis();
-
-  // --- CHANGED: MUST call decoder->copy() ---
-  if (decoder && decoder->isRunning()) {
-    copy_stream.copy(*decoder);
-  }
-  // ---------------------------------------
   
   btnPrevUp.update();
   btnNextDown.update();
   btnSelectPlay.update();
   
-  // --- CHANGED: Use real audio time and end-of-song logic ---
   if (currentState == STATE_PLAYING && isPlaying) {
-    int newTimeSec = 0;
-    
-    // Calculate current time from byte position
-    if (info.byteRate() > 0) {
-      newTimeSec = source.pos() / info.byteRate();
-    }
-    
-    if (newTimeSec != currentSongTimeSec) {
-      currentSongTimeSec = newTimeSec;
-      requestRedraw(); // Only redraw progress bar if time changed
-    }
-    
-    // Check for end-of-song
-    if (decoder && !decoder->isRunning() && source.pos() > 0 && source.pos() >= source.size()) {
-       handleNextSong();
+    if (currentTime - lastTimeUpdate > 1000) {
+      currentSongTimeSec++;
+      lastTimeUpdate = currentTime;
+      
+      if (currentSongTimeSec > songDurationSec) {
+        handleNextSong();
+      }
+      requestRedraw();
     }
   }
-  // ---------------------------------------
   
   switch (currentState) {
     case STATE_HOME:
@@ -363,7 +434,6 @@ void loadMetadata() {
     song.artist = songObj["artist"].as<String>();
     song.album = songObj["album"].as<String>();
     song.albumArt = songObj["albumArt"].as<String>();
-    song.duration = songObj["duration"] | 180; // <-- ADDED: Load duration
     songs.push_back(song);
     
     // Check if artist/album already exists before adding
@@ -468,10 +538,22 @@ void handleMenuInput() {
           // TODO: Filter songs by selected album
           break;
         case MENU_SONGS:
-          // --- CHANGED: Use startPlayback function ---
+          // This case assumes the list is not filtered
+          // If filtered, playingSongIndex must be mapped to the main 'songs' vector index
+          playingSongIndex = selectedMenuIndex;
           currentState = STATE_PLAYING;
-          startPlayback(selectedMenuIndex);
-          // -------------------------------------------
+          isPlaying = true;
+          currentSongTimeSec = 0;
+          prevSongTimeSec = -1;
+          songDurationSec = 180 + (playingSongIndex * 15); // Mock duration
+          lastTimeUpdate = millis();
+          
+          // --- THIS IS WHERE YOU WOULD START PLAYBACK ---
+          // String fileToPlay = "/music/" + songs[playingSongIndex].filename;
+          // audio.connecttoFS(SD_MMC, fileToPlay.c_str());
+          // ---------------------------------------------------
+
+          requestRedraw(true);
           break;
       }
     }
@@ -500,14 +582,14 @@ void handleMenuInput() {
 }
 
 void handlePlayingInput() {
-  // --- CHANGED: Re-written for AudioTools ---
   if (btnSelectPlay.fell()) {
     prevIsPlaying = isPlaying;
     isPlaying = !isPlaying;
     if (isPlaying) {
-      i2s_out.resume();
+      lastTimeUpdate = millis();
+      // audio.resume();
     } else {
-      i2s_out.pause();
+      // audio.pause();
     }
     requestRedraw();
   }
@@ -519,10 +601,7 @@ void handlePlayingInput() {
   if (btnPrevUp.fell()) {
     unsigned long pressTime = millis();
     if (pressTime - lastPrevPressTime < DOUBLE_CLICK_MS) {
-      // Double-click: Go back to menu
-      if (decoder) decoder->end();
-      source.close();
-      
+      // audio.stopSong();
       previousState = currentState;
       currentState = STATE_MENU; 
       isPlaying = false;
@@ -530,11 +609,10 @@ void handlePlayingInput() {
       requestRedraw(true);
       lastPrevPressTime = 0;
     } else {
-      // Single-click: Rewind
-      source.seek(0);
-      
+      // audio.rewind();
       prevSongTimeSec = currentSongTimeSec;
       currentSongTimeSec = 0;
+      lastTimeUpdate = millis();
       lastPrevPressTime = pressTime;
       requestRedraw();
     }
@@ -544,66 +622,41 @@ void handlePlayingInput() {
 // ------------------------------------
 //     ACTION HELPER FUNCTIONS
 // ------------------------------------
-
-// --- ADDED: New playback function ---
-void startPlayback(int songIndex) {
-  if (songIndex < 0 || songIndex >= songs.size()) return;
-
-  playingSongIndex = songIndex;
-  
-  // Stop previous playback
-  if (decoder && decoder->isRunning()) {
-    decoder->end();
-  }
-  source.close();
-
-  // Open new file
-  String fileToPlay = "/music/" + songs[playingSongIndex].filename;
-  if (!source.open(fileToPlay.c_str())) {
-    Serial.print("Failed to open for playback: ");
-    Serial.println(fileToPlay);
-    return;
-  }
-
-  // Get metadata again for playback info (duration, byterate)
-  info.begin(&source, false); // false = don't autoclose
-  songDurationSec = info.duration();
-  if (songDurationSec <= 0) songDurationSec = 1; // Avoid divide by zero
-
-  // Start the decoder
-  if (fileToPlay.endsWith(".mp3")) {
-    decoder = &mp3;
-  } else {
-    // Add other decoders here (e.g., AAC, FLAC)
-    Serial.println("Unsupported file type");
-    source.close();
-    return;
-  }
-
-  decoder->begin(&source, &copy_stream); // Start decoding
-  
-  // Reset player state
-  isPlaying = true;
-  currentSongTimeSec = 0;
-  prevSongTimeSec = -1;
-  requestRedraw(true); // Request full redraw for new song info
-}
-
 void handleNextSong() {
-  // --- CHANGED: Simplified ---
   prevPlayingSongIndex = playingSongIndex;
-  int nextIndex = (playingSongIndex + 1) % songs.size(); 
-  startPlayback(nextIndex);
+  playingSongIndex = (playingSongIndex + 1) % songs.size(); 
+  isPlaying = true;
+  prevSongTimeSec = -1;
+  currentSongTimeSec = 0;
+  songDurationSec = 180 + (playingSongIndex * 15);
+  lastTimeUpdate = millis();
+  
+  // --- START NEXT SONG ---
+  // String fileToPlay = "/music/" + songs[playingSongIndex].filename;
+  // audio.connecttoFS(SD_MMC, fileToPlay.c_str());
+  // -------------------------
+  
+  requestRedraw(true);
 }
 
 void handlePrevSong() {
-  // --- CHANGED: Simplified ---
   prevPlayingSongIndex = playingSongIndex;
-  int prevIndex = playingSongIndex - 1;
-  if (prevIndex < 0) {
-    prevIndex = songs.size() - 1; 
+  playingSongIndex--;
+  if (playingSongIndex < 0) {
+    playingSongIndex = songs.size() - 1; 
   }
-  startPlayback(prevIndex);
+  isPlaying = true;
+  prevSongTimeSec = -1;
+  currentSongTimeSec = 0;
+  songDurationSec = 180 + (playingSongIndex * 15);
+  lastTimeUpdate = millis();
+
+  // --- START PREV SONG ---
+  // String fileToPlay = "/music/" + songs[playingSongIndex].filename;
+  // audio.connecttoFS(SD_MMC, fileToPlay.c_str());
+  // -------------------------
+
+  requestRedraw(true);
 }
 
 // ------------------------------------
@@ -647,10 +700,7 @@ void drawScrollbar(int currentIndex, int totalItems, int yStart, int height) {
   tft.fillRect(SCREEN_WIDTH - 10, yStart, 8, height, IPOD_WHITE);
   int barHeight = height;
   int thumbHeight = max(20, barHeight / totalItems);
-  int thumbY = yStart;
-  if (totalItems > 1) {
-    thumbY = yStart + (currentIndex * (barHeight - thumbHeight) / (totalItems - 1));
-  }
+  int thumbY = yStart + (currentIndex * (barHeight - thumbHeight) / (totalItems - 1));
   
   tft.fillRect(SCREEN_WIDTH - 10, yStart, 8, barHeight, IPOD_LIGHT_GRAY);
   tft.fillRect(SCREEN_WIDTH - 10, thumbY, 8, thumbHeight, IPOD_DARK_GRAY);
@@ -660,7 +710,6 @@ void updateProgressBar() {
   int progressY = 355;  
   
   if (currentSongTimeSec != prevSongTimeSec) {
-    // Clear old times
     tft.fillRect(30, progressY, 60, 16, IPOD_WHITE);
     tft.fillRect(SCREEN_WIDTH - 90, progressY, 60, 16, IPOD_WHITE);
     
@@ -671,17 +720,8 @@ void updateProgressBar() {
     tft.drawString(formatTime(currentSongTimeSec), 30, progressY);
     
     tft.setTextDatum(TR_DATUM);
-    // Only draw duration if it's valid
-    if (songDurationSec > 0) {
-      tft.drawString(formatTime(songDurationSec), SCREEN_WIDTH - 30, progressY);
-    }
-    
-    // --- CHANGED: Added divide-by-zero check ---
-    float percent = 0;
-    if (songDurationSec > 0) {
-      percent = (float)currentSongTimeSec / (float)songDurationSec;
-    }
-        
+    tft.drawString(formatTime(songDurationSec), SCREEN_WIDTH - 30, progressY);
+        float percent = (float)currentSongTimeSec / (float)songDurationSec;
     int barWidth = SCREEN_WIDTH - 60;
     int barX = 30;
     int barY = progressY + 20;
@@ -690,7 +730,6 @@ void updateProgressBar() {
     tft.drawRoundRect(barX, barY, barWidth, 10, 5, IPOD_DARK_GRAY);
     
     int fillWidth = (int)(percent * (barWidth - 2));
-    if (fillWidth > (barWidth - 2)) fillWidth = barWidth - 2; // Cap fill width
     if (fillWidth > 0) {
       tft.fillRoundRect(barX + 1, barY + 1, fillWidth, 8, 4, IPOD_BLUE);
     }

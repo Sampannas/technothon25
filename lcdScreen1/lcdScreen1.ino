@@ -1,20 +1,30 @@
 #include <TFT_eSPI.h> // For the color TFT
-// #include <SPI.h>   // <-- No longer needed for SD_MMC
 #include <Bounce2.h>
 #include <vector>     // Include vector library
 #include <Arduino.h>
-#include <SD_MMC.h>     // <-- Correct
+#include <SD_MMC.h>     
 #include <ArduinoJson.h>
-#include "Audio.h" // Assumes this is the ESP8266Audio or similar library
-#include "AudioTools.h"  // Arduino Audio Tools for metadata extraction
-#include "AudioTools/AudioCodecs/CodecMP3Helix.h"  // For MP3 metadata
+#include "AudioTools.h"  
+#include "AudioTools/AudioCodecs/CodecMP3Helix.h"  
+using namespace fs;
 TFT_eSPI tft = TFT_eSPI();
-Audio audio;
+
+// Your I2S Pins
+#define I2S_LRCK_PIN    25
+#define I2S_DIN_PIN     26
+#define I2S_BCK_PIN     27
+
+I2SStream i2s;
+MP3DecoderHelix mp3;
+EncodedAudioStream decoder(&i2s, &mp3);
+StreamCopy copier;
+File audioFile;
+bool audioInitialized = false;
 
 // Button Pins
-#define BTN_PREV_UP_PIN 12
-#define BTN_NEXT_DOWN_PIN 13
-#define BTN_SELECT_PLAY_PIN 14
+#define BTN_PREV_UP_PIN 33
+#define BTN_NEXT_DOWN_PIN 34
+#define BTN_SELECT_PLAY_PIN 0
 
 // --- Button Logic ---
 Bounce btnPrevUp = Bounce();
@@ -319,8 +329,23 @@ void setup() {
     tft.drawString("SD Card Error", SCREEN_WIDTH/2, SCREEN_HEIGHT/2);
     while (1);
   }
-  
   Serial.println("SD_MMC Card OK.");
+  
+  // Initialize Audio System
+  auto config = i2s.defaultConfig(TX_MODE);
+  config.pin_ws = I2S_LRCK_PIN;
+  config.pin_data = I2S_DIN_PIN;
+  config.pin_bck = I2S_BCK_PIN;
+  config.pin_mck = 0;
+  config.i2s_format = I2S_STD_FORMAT;
+  config.buffer_count = 8;
+  config.buffer_size = 1024;
+  
+  i2s.begin(config);
+  decoder.begin();
+  
+  audioInitialized = true;
+  Serial.println("Audio System Initialized");
   
   // Show indexing message
   tft.fillScreen(IPOD_BLACK);
@@ -330,7 +355,6 @@ void setup() {
   tft.drawString("Please wait", SCREEN_WIDTH/2, SCREEN_HEIGHT/2 + 20);
   
   Serial.println("Indexing music files...");
-  
   if (generateMetadata()) {
     Serial.println("Metadata generated successfully");
     tft.drawString("Indexing complete!", SCREEN_WIDTH/2, SCREEN_HEIGHT/2 + 40);
@@ -344,7 +368,6 @@ void setup() {
   
   loadMetadata();
   populateMenuItems();
-  
   tft.fillScreen(IPOD_WHITE);
   
   // Setup Buttons
@@ -362,9 +385,8 @@ void setup() {
   
   requestRedraw(true);
 }
-// ------------------------------------
-//         MAIN LOOP
-// ------------------------------------
+
+// --- COMPLETE loop() FUNCTION ---
 void loop() {
   unsigned long currentTime = millis();
   
@@ -372,14 +394,22 @@ void loop() {
   btnNextDown.update();
   btnSelectPlay.update();
   
-  if (currentState == STATE_PLAYING && isPlaying) {
+  // Handle audio streaming
+  if (isPlaying && audioFile) {
+    if (!copier.copy()) {
+      // Song finished, play next
+      handleNextSong();
+    }
+  }
+  
+  // Update song progress based on actual playback
+  if (currentState == STATE_PLAYING && isPlaying && audioFile) {
+            Serial.println("Shoudl be playing");
+
     if (currentTime - lastTimeUpdate > 1000) {
+      // Get actual position if possible, otherwise increment
       currentSongTimeSec++;
       lastTimeUpdate = currentTime;
-      
-      if (currentSongTimeSec > songDurationSec) {
-        handleNextSong();
-      }
       requestRedraw();
     }
   }
@@ -402,6 +432,7 @@ void loop() {
     needsRedraw = false;
   }
 }
+
 
 // ------------------------------------
 //     METADATA & MENU LOGIC
@@ -502,7 +533,7 @@ void handleHomeInput() {
     requestRedraw(true);
   }
 }
-
+// --- COMPLETE handleMenuInput() FUNCTION ---
 void handleMenuInput() {
   if (btnSelectPlay.fell()) {
     if (selectedMenuIndex == currentMenuItems.size() - 1) {
@@ -537,22 +568,36 @@ void handleMenuInput() {
         case MENU_ALBUMS:
           // TODO: Filter songs by selected album
           break;
-        case MENU_SONGS:
-          // This case assumes the list is not filtered
-          // If filtered, playingSongIndex must be mapped to the main 'songs' vector index
+          case MENU_SONGS:
           playingSongIndex = selectedMenuIndex;
           currentState = STATE_PLAYING;
-          isPlaying = true;
+          
+          // Close any existing file
+          if (audioFile) {
+            audioFile.close();
+          }
+          
+          // Construct file path
+          String fileToPlay = "/music/" + songs[playingSongIndex].filename;
+          
+          // Open the file (no mode parameter - FIXED)
+          audioFile = SD_MMC.open(fileToPlay);
+          
+          if (audioFile) {
+            Serial.printf("Opened file: %s (%d bytes)\n", fileToPlay.c_str(), audioFile.size());
+            
+            // Initialize copier with decoder and file - FIXED
+            copier.begin(decoder, audioFile);
+            isPlaying = true;
+          } else {
+            Serial.println("Failed to open: " + fileToPlay);
+            isPlaying = false;
+          }
+          
           currentSongTimeSec = 0;
           prevSongTimeSec = -1;
-          songDurationSec = 180 + (playingSongIndex * 15); // Mock duration
+          songDurationSec = audioFile ? (audioFile.size() / 16000) : 180;
           lastTimeUpdate = millis();
-          
-          // --- THIS IS WHERE YOU WOULD START PLAYBACK ---
-          // String fileToPlay = "/music/" + songs[playingSongIndex].filename;
-          // audio.connecttoFS(SD_MMC, fileToPlay.c_str());
-          // ---------------------------------------------------
-
           requestRedraw(true);
           break;
       }
@@ -561,7 +606,7 @@ void handleMenuInput() {
   
   if (btnNextDown.fell()) {
     selectedMenuIndex = (selectedMenuIndex + 1) % currentMenuItems.size();
-    int max_items_on_screen = 5; 
+    int max_items_on_screen = 5;
     if (selectedMenuIndex >= menuOffset + max_items_on_screen) {
       menuOffset = selectedMenuIndex - max_items_on_screen + 1;
     }
@@ -572,7 +617,7 @@ void handleMenuInput() {
     selectedMenuIndex--;
     if (selectedMenuIndex < 0) {
       selectedMenuIndex = currentMenuItems.size() - 1;
-      int max_items_on_screen = 5; 
+      int max_items_on_screen = 5;
       menuOffset = max(0, (int)currentMenuItems.size() - max_items_on_screen);
     } else if (selectedMenuIndex < menuOffset) {
       menuOffset = selectedMenuIndex;
@@ -581,16 +626,18 @@ void handleMenuInput() {
   }
 }
 
+
+// --- FIXED handlePlayingInput() FUNCTION ---
 void handlePlayingInput() {
   if (btnSelectPlay.fell()) {
     prevIsPlaying = isPlaying;
     isPlaying = !isPlaying;
-    if (isPlaying) {
+    
+    if (isPlaying && audioFile) {
+      // Resume playback - copier will continue in loop()
       lastTimeUpdate = millis();
-      // audio.resume();
-    } else {
-      // audio.pause();
     }
+    // Pause is handled by not calling copier.copy() in loop()
     requestRedraw();
   }
   
@@ -601,15 +648,37 @@ void handlePlayingInput() {
   if (btnPrevUp.fell()) {
     unsigned long pressTime = millis();
     if (pressTime - lastPrevPressTime < DOUBLE_CLICK_MS) {
-      // audio.stopSong();
-      previousState = currentState;
-      currentState = STATE_MENU; 
+      // Double-click: Stop and go back to menu
+      if (audioFile) {
+        audioFile.close();
+      }
       isPlaying = false;
-      prevSelectedSongIndex = -1;  
+      previousState = currentState;
+      currentState = STATE_MENU;
+      prevSelectedSongIndex = -1;
       requestRedraw(true);
       lastPrevPressTime = 0;
     } else {
-      // audio.rewind();
+      // Single click: Restart current song
+      if (audioFile) {
+        audioFile.close();
+      }
+      
+      // Reopen the current song
+      String fileToPlay = "/music/" + songs[playingSongIndex].filename;
+      audioFile = SD_MMC.open(fileToPlay);  // FIXED - no mode parameter
+      
+      if (audioFile) {
+        Serial.printf("Restarting: %s (%d bytes)\n", fileToPlay.c_str(), audioFile.size());
+        
+        // Re-initialize copier - FIXED
+        copier.begin(decoder, audioFile);
+        isPlaying = true;
+      } else {
+        Serial.println("Failed to reopen: " + fileToPlay);
+        isPlaying = false;
+      }
+      
       prevSongTimeSec = currentSongTimeSec;
       currentSongTimeSec = 0;
       lastTimeUpdate = millis();
@@ -619,43 +688,74 @@ void handlePlayingInput() {
   }
 }
 
-// ------------------------------------
-//     ACTION HELPER FUNCTIONS
-// ------------------------------------
+// --- FIXED handleNextSong() FUNCTION ---
 void handleNextSong() {
   prevPlayingSongIndex = playingSongIndex;
-  playingSongIndex = (playingSongIndex + 1) % songs.size(); 
-  isPlaying = true;
+  playingSongIndex = (playingSongIndex + 1) % songs.size();
+  
+  // Close current file
+  if (audioFile) {
+    audioFile.close();
+  }
+  
+  // Construct file path
+  String fileToPlay = "/music/" + songs[playingSongIndex].filename;
+  
+  // Open the file - FIXED (no mode parameter)
+  audioFile = SD_MMC.open(fileToPlay);
+  
+  if (audioFile) {
+    Serial.printf("Playing next: %s (%d bytes)\n", fileToPlay.c_str(), audioFile.size());
+    
+    // Re-initialize copier - FIXED
+    copier.begin(decoder, audioFile);
+    isPlaying = true;
+  } else {
+    Serial.println("Failed to open: " + fileToPlay);
+    isPlaying = false;
+  }
+  
   prevSongTimeSec = -1;
   currentSongTimeSec = 0;
-  songDurationSec = 180 + (playingSongIndex * 15);
+  songDurationSec = audioFile ? (audioFile.size() / 16000) : 180;
   lastTimeUpdate = millis();
-  
-  // --- START NEXT SONG ---
-  // String fileToPlay = "/music/" + songs[playingSongIndex].filename;
-  // audio.connecttoFS(SD_MMC, fileToPlay.c_str());
-  // -------------------------
-  
   requestRedraw(true);
 }
 
+// --- FIXED handlePrevSong() FUNCTION ---
 void handlePrevSong() {
   prevPlayingSongIndex = playingSongIndex;
   playingSongIndex--;
   if (playingSongIndex < 0) {
-    playingSongIndex = songs.size() - 1; 
+    playingSongIndex = songs.size() - 1;
   }
-  isPlaying = true;
+  
+  // Close current file
+  if (audioFile) {
+    audioFile.close();
+  }
+  
+  // Construct file path
+  String fileToPlay = "/music/" + songs[playingSongIndex].filename;
+  
+  // Open the file - FIXED (no mode parameter)
+  audioFile = SD_MMC.open(fileToPlay);
+  
+  if (audioFile) {
+    Serial.printf("Playing previous: %s (%d bytes)\n", fileToPlay.c_str(), audioFile.size());
+    
+    // Re-initialize copier - FIXED
+    copier.begin(decoder, audioFile);
+    isPlaying = true;
+  } else {
+    Serial.println("Failed to open: " + fileToPlay);
+    isPlaying = false;
+  }
+  
   prevSongTimeSec = -1;
   currentSongTimeSec = 0;
-  songDurationSec = 180 + (playingSongIndex * 15);
+  songDurationSec = audioFile ? (audioFile.size() / 16000) : 180;
   lastTimeUpdate = millis();
-
-  // --- START PREV SONG ---
-  // String fileToPlay = "/music/" + songs[playingSongIndex].filename;
-  // audio.connecttoFS(SD_MMC, fileToPlay.c_str());
-  // -------------------------
-
   requestRedraw(true);
 }
 
